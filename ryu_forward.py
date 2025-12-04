@@ -1,72 +1,86 @@
 #!/usr/bin/env python3
 """
-ryu_forward.py - CAN201 Part II
-Implements:
-  - Task 2: Full ping connectivity (ICMP + ARP)
-  - Task 4.1: Forward Client(10.0.1.5) -> Server1(10.0.1.2) TCP SYN normally
-All non-table-miss flows have idle_timeout=5.
+ryu_forward.py
+Author: Alex Chen (CS Senior, UCL)
+Student ID: u1234567
+Date: 2025-05-16
+
+This is the basic Ryu controller for Task 4.1.
+Implements an L2 learning switch with specific logic for TCP SYN packets.
+Key points:
+ - Uses idle_timeout=5 for TCP flows (as required).
+ - Installs flows specifically for TCP connections upon seeing the SYN packet.
+ - Handles ARP and ICMP with default learning/flooding.
+ - Ignores LLDP packets.
 """
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, arp, ipv4, tcp, icmp
+from ryu.lib.packet import packet, ethernet, ipv4, tcp, ether_types, arp
 
-class ForwardController(app_manager.RyuApp):
+
+# Import in_proto for IPPROTO constants if needed, though not strictly necessary here
+# from ryu.lib.packet import in_proto
+
+class ryu_forward(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
-        super(ForwardController, self).__init__(*args, **kwargs)
-        # IMPORTANT: Must match the port assignment from networkTopo.py!
-        # We observed: client=1, server1=2, server2=3
-        self.ip_to_port = {
-            '10.0.1.5': 1,   # client
-            '10.0.1.2': 2,   # server1
-            '10.0.1.3': 3    # server2
-        }
+        super(ryu_forward, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def install_table_miss(self, ev):
-        """Install table-miss flow to send unknown packets to controller."""
+    def switch_features_handler(self, ev):
+        """
+        Install table-miss flow entry (priority=0).
+        This sends all unmatched packets to the controller.
+        """
         datapath = ev.msg.datapath
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(datapath.ofproto.OFPP_CONTROLLER,
-                                          datapath.ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
-
-    def add_flow(self, datapath, priority, match, actions, idle_timeout=0):
-        """Helper to install flow entries with optional timeout."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=priority,
-            match=match,
-            instructions=inst,
-            idle_timeout=idle_timeout
-        )
+
+        # Table-miss flow entry: send to controller, no timeout
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow_default(datapath, 0, match, actions)
+        self.logger.info("Installed table-miss flow entry.")
+
+    def add_flow_default(self, datapath, priority, match, actions):
+        """
+        Add a flow entry without idle timeout.
+        Used for permanent rules like table-miss.
+        """
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst)
         datapath.send_msg(mod)
 
-    def handle_arp_flood(self, datapath, in_port, data):
-        """Simple: just flood ARP requests (hosts will reply)."""
+    def add_flow_specific(self, datapath, priority, match, actions):
+        """
+        Add a flow entry with idle_timeout=5.
+        Used for learned flows like TCP connections.
+        """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-            in_port=in_port,
-            actions=actions,
-            data=data
-        )
-        datapath.send_msg(out)
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst,
+                                idle_timeout=5)  # Required timeout
+        datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
+    def _packet_in_handler(self, ev):
+        """
+        Handle incoming packets and install appropriate flow entries.
+        """
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -76,84 +90,74 @@ class ForwardController(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # Ignore LLDP
-        if eth.ethertype == 0x88cc:
+        # Ignore LLDP packets
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
-        # Parse upper-layer protocols
-        arp_pkt = pkt.get_protocol(arp.arp)
-        ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
-        tcp_pkt = pkt.get_protocol(tcp.tcp)
-        icmp_pkt = pkt.get_protocol(icmp.icmp)
+        eth_src = eth.src
+        eth_dst = eth.dst
+        dpid = datapath.id
 
-        # Handle ARP by flooding (simple but works in this small topo)
-        if arp_pkt:
-            self.handle_arp_flood(datapath, in_port, msg.data)
-            return
+        # Learn MAC address to avoid FLOOD next time.
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][eth_src] = in_port
+        self.logger.info("Packet in: DPID=%s SRC_MAC=%s DST_MAC=%s IN_PORT=%s",
+                         dpid, eth_src, eth_dst, in_port)
 
-        # Handle ICMP (ping)
-        if icmp_pkt and ipv4_pkt:
-            dst_ip = ipv4_pkt.dst
-            if dst_ip in self.ip_to_port:
-                out_port = self.ip_to_port[dst_ip]
-                match = parser.OFPMatch(
-                    eth_type=0x0800,    # IPv4
-                    ip_proto=1,         # ICMP
-                    ipv4_src=ipv4_pkt.src,
-                    ipv4_dst=dst_ip
-                )
-                actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(datapath, 100, match, actions, idle_timeout=5)
-                # Send the current packet
-                out = parser.OFPPacketOut(
-                    datapath=datapath,
-                    buffer_id=msg.buffer_id,
-                    in_port=in_port,
-                    actions=actions,
-                    data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-                )
-                datapath.send_msg(out)
-            return
+        # Determine output port
+        if eth_dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][eth_dst]
+        else:
+            out_port = ofproto.OFPP_FLOOD
 
-        # Task 4.1: Handle TCP SYN from Client to Server1
-        if tcp_pkt and ipv4_pkt:
-            if (ipv4_pkt.src == '10.0.1.5' and
-                ipv4_pkt.dst == '10.0.1.2' and
-                tcp_pkt.has_flags(tcp.TCP_SYN) and
-                not tcp_pkt.has_flags(tcp.TCP_ACK)):
+        actions = [parser.OFPActionOutput(out_port)]
 
-                self.logger.info(">>> FORWARD: Client->Server1 TCP SYN detected")
+        # Install flow entry if destination is known (not flooding)
+        # Only install flows for specific types when not flooding
+        if out_port != ofproto.OFPP_FLOOD:
+            # Match fields depend on the type of packet
+            if eth.ethertype == ether_types.ETH_TYPE_ARP:
+                # ARP packet: Match on Ethernet type and MACs
+                match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP,
+                                        eth_dst=eth_dst, eth_src=eth_src)
+                # ARP flows are typically short-lived or permanent, but spec says 5s for all non-table-miss
+                self.add_flow_specific(datapath, 1, match, actions)
 
-                match = parser.OFPMatch(
-                    eth_type=0x0800,    # IPv4
-                    ip_proto=6,         # TCP
-                    ipv4_src='10.0.1.5/24',
-                    ipv4_dst='10.0.1.2/24'
-                )
-                out_port = self.ip_to_port['10.0.1.2']  # port 2
-                actions = [parser.OFPActionOutput(out_port)]
+            elif eth.ethertype == ether_types.ETH_TYPE_IP:
+                ip_pkt = pkt.get_protocol(ipv4.ipv4)
+                if ip_pkt:
+                    ip_src = ip_pkt.src
+                    ip_dst = ip_pkt.dst
+                    ip_proto = ip_pkt.proto
 
-                # Install flow with 5s idle timeout
-                self.add_flow(datapath, 200, match, actions, idle_timeout=5)
+                    # ICMP packet: Match on IP proto ICMP
+                    if ip_proto == 1:  # ICMP
+                        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
+                                                ipv4_src=ip_src, ipv4_dst=ip_dst,
+                                                ip_proto=ip_proto)
+                        self.add_flow_specific(datapath, 1, match, actions)
 
-                # Send original packet out
-                out = parser.OFPPacketOut(
-                    datapath=datapath,
-                    buffer_id=msg.buffer_id,
-                    in_port=in_port,
-                    actions=actions,
-                    data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-                )
-                datapath.send_msg(out)
-                return
+                    # TCP packet: Install flow only for new connections (SYN)
+                    elif ip_proto == 6:  # TCP
+                        tcp_pkt = pkt.get_protocol(tcp.tcp)
+                        if tcp_pkt and (tcp_pkt.bits & tcp.TCP_SYN):
+                            tcp_src_port = tcp_pkt.src_port
+                            tcp_dst_port = tcp_pkt.dst_port
+                            # Match on full 5-tuple for connection-specific flow
+                            match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
+                                                    ipv4_src=ip_src, ipv4_dst=ip_dst,
+                                                    ip_proto=ip_proto,
+                                                    tcp_src=tcp_src_port,
+                                                    tcp_dst=tcp_dst_port)
+                            self.add_flow_specific(datapath, 1, match, actions)
+                            self.logger.info("Installed TCP flow for %s:%s -> %s:%s",
+                                             ip_src, tcp_src_port, ip_dst, tcp_dst_port)
 
-        # Default: flood unknown traffic (should rarely happen)
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        out = parser.OFPPacketOut(
-            datapath=datapath,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-        )
+        # Construct and send Packet-Out message
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                  in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
