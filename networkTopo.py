@@ -4,50 +4,90 @@ from mininet.node import RemoteController, OVSKernelSwitch, Host
 from mininet.term import makeTerm
 
 
+def initializeNetwork():
+    """Initialize and configure the network topology"""
+    # Create network instance with specific configurations
+    network = Mininet(autoSetMacs=False, build=False, ipBase='10.0.1.0/24')
+    return network
+
+
+def configureControllers(network):
+    """Add and configure remote controllers"""
+    controller = network.addController('c1', RemoteController)
+    return controller
+
+
+def createHosts(network):
+    """Create host nodes with specific configurations"""
+    # Define hosts with custom settings
+    client_host = network.addHost('client', cls=Host, defaultRoute=None)
+    server_one = network.addHost('server_1', cls=Host, defaultRoute=None)
+    server_two = network.addHost('server_2', cls=Host, defaultRoute=None)
+    return client_host, server_one, server_two
+
+
+def setupSwitch(network):
+    """Create and configure SDN switch"""
+    switch = network.addSwitch('s1', cls=OVSKernelSwitch, failMode='secure')
+    return switch
+
+
+def establishConnections(network, client, server1, server2, switch):
+    """Establish network links between components"""
+    network.addLink(client, switch)
+    network.addLink(server1, switch)
+    network.addLink(server2, switch)
+
+
+def assignNetworkAddresses(client, server1, server2):
+    """Configure IP addresses for host interfaces"""
+    client.setIP(intf='client-eth0', ip='10.0.1.5/24')
+    server1.setIP(intf='server_1-eth0', ip='10.0.1.2/24')
+    server2.setIP(intf='server_2-eth0', ip='10.0.1.3/24')
+
+
+def setMacAddresses(client, server1, server2):
+    """Assign specific MAC addresses to host interfaces"""
+    client.setMAC(intf="client-eth0", mac="00:00:00:00:00:03")
+    server1.setMAC(intf="server_1-eth0", mac="00:00:00:00:00:01")
+    server2.setMAC(intf="server_2-eth0", mac="00:00:00:00:00:02")
+
+
+def launchTerminalSessions(network, client, server1, server2, switch, controller):
+    """Launch terminal sessions for all network components"""
+    network.terms += makeTerm(client)
+    network.terms += makeTerm(server1)
+    network.terms += makeTerm(server2)
+    network.terms += makeTerm(switch)
+    network.terms += makeTerm(controller)
+
+
 def myTopo():
-    # create net
-    net = Mininet(autoSetMacs=False, build=False, ipBase='10.0.1.0/24')
-
-    # add remote controller
-    SDN_Controller = net.addController('c1', RemoteController)
-
-    # add host
-    Client = net.addHost('client', cls=Host, defaultRoute=None)
-    Server1 = net.addHost('server_1', cls=Host, defaultRoute=None)
-    Server2 = net.addHost('server_2', cls=Host, defaultRoute=None)
-
-    # add switch
-    SDN_Switch = net.addSwitch('s1', cls=OVSKernelSwitch, failMode='secure')
-
-    # add link
-    net.addLink(Client, SDN_Switch)
-    net.addLink(Server1, SDN_Switch)
-    net.addLink(Server2, SDN_Switch)
-
-    # network build
+    # Initialize network infrastructure
+    net = initializeNetwork()
+    
+    # Setup network components
+    sdn_controller = configureControllers(net)
+    client_node, server_one, server_two = createHosts(net)
+    sdn_switch = setupSwitch(net)
+    
+    # Establish network connectivity
+    establishConnections(net, client_node, server_one, server_two, sdn_switch)
+    
+    # Build network topology
     net.build()
-
-    # assign IP address to interface of hosts
-    Client.setIP(intf='client-eth0', ip='10.0.1.5/24')
-    Server1.setIP(intf='server_1-eth0', ip='10.0.1.2/24')
-    Server2.setIP(intf='server_2-eth0', ip='10.0.1.3/24')
-
-    # assign mac to each interface
-    Client.setMAC(intf="client-eth0", mac="00:00:00:00:00:03")
-    Server1.setMAC(intf="server_1-eth0", mac="00:00:00:00:00:01")
-    Server2.setMAC(intf="server_2-eth0", mac="00:00:00:00:00:02")
-
-    # network start
+    
+    # Configure network addressing
+    assignNetworkAddresses(client_node, server_one, server_two)
+    setMacAddresses(client_node, server_one, server_two)
+    
+    # Activate network
     net.start()
-
-    # start xterm
-    net.terms += makeTerm(Client)
-    net.terms += makeTerm(Server1)
-    net.terms += makeTerm(Server2)
-    net.terms += makeTerm(SDN_Switch)
-    net.terms += makeTerm(SDN_Controller)
-
-    # CLI mode running
+    
+    # Launch terminal interfaces
+    launchTerminalSessions(net, client_node, server_one, server_two, sdn_switch, sdn_controller)
+    
+    # Enter interactive mode
     CLI(net)
     net.stop()
 
