@@ -25,13 +25,12 @@ hosts = {
 }
 
 
-class ryu_forward(app_manager.RyuApp):
+class RedirectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-
     def __init__(self, *args, **kwargs):
-        super(ryu_forward, self).__init__(*args, **kwargs)
-        self.mac_to_port= {}
+        super(RedirectController, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
 
     def _get_output_port(self, dpid, dst_mac):
         """
@@ -258,4 +257,5 @@ class ryu_forward(app_manager.RyuApp):
         # packetOut logger
         self.logger.info(
             f"[PACKET_OUT] DstMAC={dst} OutPort={out_port}"
+
         )
