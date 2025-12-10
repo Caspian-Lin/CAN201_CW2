@@ -80,7 +80,7 @@ class SimpleForwardingController(app_manager.RyuApp):
         """
         self._install_flow_entry(datapath, priority, match, actions, buffer_id, timeout=5)
 
-    def _determine_output_port(self, dpid, dst_mac):
+    def _determine_output_port(self, dpid, dst_mac, ofproto):
         """
         Determine output port for a given destination MAC address.
         :param dpid: Datapath ID
@@ -134,7 +134,7 @@ class SimpleForwardingController(app_manager.RyuApp):
             f"\n[PACKET_IN] Switch={dpid} SrcMAC={src} DstMAC={dst} InPort={in_port}"
         )
         # Determine output port
-        out_port = self._determine_output_port(dpid, dst)
+        out_port = self._determine_output_port(dpid, dst, ofproto)
         
         # Define packetOut action
         actions = [parser.OFPActionOutput(out_port)]
