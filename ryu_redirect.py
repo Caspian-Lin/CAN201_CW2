@@ -8,254 +8,275 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 
 
-# Host configuration dictionary
-hosts = {
-    'client': {
-        'ip': '10.0.1.5',
-        'mac': '00:00:00:00:00:03'
-    },
-    'server_1': {
-        'ip': '10.0.1.2',
-        'mac': '00:00:00:00:00:01'
-    },
-    'server_2': {
-        'ip': '10.0.1.3',
-        'mac': '00:00:00:00:00:02'
-    }
-}
+class NetworkEndpoint:
+    """Represents a network endpoint with IP and MAC"""
+    def __init__(self, ip, mac):
+        self.ip = ip
+        self.mac = mac
 
 
 class RedirectController(app_manager.RyuApp):
+    """SDN controller implementing intelligent traffic redirection"""
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(RedirectController, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-
-    def _get_output_port(self, dpid, dst_mac):
-        """
-        Get output port for a given destination MAC address.
-        :param dpid: Datapath ID
-        :param dst_mac: Destination MAC address
-        :return: Output port number or OFPP_FLOOD if unknown
-        """
-        if dst_mac in self.mac_to_port.get(dpid, {}):
-            return self.mac_to_port[dpid][dst_mac]
-        else:
-            return ofproto_v1_3.OFPP_FLOOD
-
-    def _create_match(self, parser, fields):
-        """
-        Create an OFPMatch object from a dictionary of fields.
-        :param parser: Parser object from datapath
-        :param fields: Dictionary of match fields
-        :return: OFPMatch object
-        """
-        # Filter out None values
-        filtered_fields = {k: v for k, v in fields.items() if v is not None}
-        return parser.OFPMatch(**filtered_fields)
-
+        self.forwarding_table = {}
+        self.timeout_duration = 5
+        
+        self.endpoints = {
+            'client': NetworkEndpoint('10.0.1.5', '00:00:00:00:00:03'),
+            'server_primary': NetworkEndpoint('10.0.1.2', '00:00:00:00:00:01'),
+            'server_backup': NetworkEndpoint('10.0.1.3', '00:00:00:00:00:02')
+        }
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        """
-        set up default packetIn rule
-        :param ev:
-        :return:
-        """
-        datapath = ev.msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow_default(datapath, 0, match, actions)
-
-
-    def _add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0):
-        """
-        Unified method to add flow entries
-        :param datapath: Datapath object
-        :param priority: Flow priority
-        :param match: Match conditions
-        :param actions: Actions to execute
-        :param buffer_id: Buffered packet ID
-        :param idle_timeout: Idle timeout for flow entry
-        :return: None
-        """
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+    def initialize_switch(self, ev):
+        """Configure switch with default forwarding rule"""
+        dp = ev.msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
         
-        # Prepare flow mod parameters
+        default_match = parser.OFPMatch()
+        controller_action = [parser.OFPActionOutput(
+            ofp.OFPP_CONTROLLER,
+            ofp.OFPCML_NO_BUFFER
+        )]
+        self._add_static_flow(dp, 0, default_match, controller_action)
+
+    def _add_static_flow(self, datapath, priority, match, actions, buffer_id=None):
+        """Add permanent flow entry to switch"""
+        ofp = datapath.ofproto
+        parser = datapath.ofproto_parser
+        instructions = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        
         flow_params = {
             'datapath': datapath,
             'priority': priority,
             'match': match,
-            'instructions': inst
+            'instructions': instructions
         }
-        
-        # Add buffer_id if present
         if buffer_id:
             flow_params['buffer_id'] = buffer_id
-            
-        # Add idle timeout if specified
-        if idle_timeout > 0:
-            flow_params['idle_timeout'] = idle_timeout
-            
-        # Create and send flow mod message
-        mod = parser.OFPFlowMod(**flow_params)
-        datapath.send_msg(mod)
+        
+        flow_mod = parser.OFPFlowMod(**flow_params)
+        datapath.send_msg(flow_mod)
 
-    def add_flow_default(self, datapath, priority, match, actions, buffer_id=None):
-        """
-        Add flow without timeout (wrapper for _add_flow)
-        """
-        self._add_flow(datapath, priority, match, actions, buffer_id)
-
-    def add_flow_specific(self, datapath, priority, match, actions, buffer_id=None):
-        """
-        Add flow with timeout (wrapper for _add_flow)
-        """
-        self._add_flow(datapath, priority, match, actions, buffer_id, idle_timeout=5)
-
+    def _add_dynamic_flow(self, datapath, priority, match, actions, buffer_id=None):
+        """Add temporary flow entry with idle timeout"""
+        ofp = datapath.ofproto
+        parser = datapath.ofproto_parser
+        instructions = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        
+        flow_params = {
+            'datapath': datapath,
+            'priority': priority,
+            'match': match,
+            'instructions': instructions,
+            'idle_timeout': self.timeout_duration
+        }
+        if buffer_id:
+            flow_params['buffer_id'] = buffer_id
+        
+        flow_mod = parser.OFPFlowMod(**flow_params)
+        datapath.send_msg(flow_mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def _packet_in_handler(self, ev):
-        """
-        packetIn handling process
-        :param ev:
-        :return:
-        """
-        # extract packet
+    def process_packet(self, ev):
+        """Main packet processing logic with redirection"""
         msg = ev.msg
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        
         pkt = packet.Packet(msg.data)
-        # get physical port
         in_port = msg.match['in_port']
-        # get ethernet data
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+        
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
-        src = eth.src
-        dst = eth.dst
-        # Learn MAC to port mapping
-        dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][src] = in_port
         
-        # Log packet-in event
-        self.logger.info(
-            f"\n[PACKET_IN] Switch={dpid} SrcMAC={src} DstMAC={dst} InPort={in_port}"
-        )
+        src_mac = eth.src
+        dst_mac = eth.dst
+        switch_id = dp.id
         
-        # Determine output port
-        out_port = self._get_output_port(dpid, dst)
-        # define packetOut action
+        self.forwarding_table.setdefault(switch_id, {})
+        self.forwarding_table[switch_id][src_mac] = in_port
+        
+        self._log_packet_arrival(switch_id, src_mac, dst_mac, in_port)
+        
+        out_port = self._lookup_port(switch_id, dst_mac, ofp)
         actions = [parser.OFPActionOutput(out_port)]
-        # formulate flow table rule
-        if out_port != ofproto.OFPP_FLOOD:
-            # ARP
-            if eth.ethertype == ether_types.ETH_TYPE_ARP:
-                self.logger.info(
-                    f"[FLOW_ADD] ARP: Switch={dpid} SrcMAC={src} DstMAC={dst} InPort={in_port}"
-                )
-                match = self._create_match(parser, {
-                    'eth_type': ether_types.ETH_TYPE_ARP,
-                    'in_port': in_port,
-                    'eth_dst': dst,
-                    'eth_src': src
-                })
-            # IP
-            if eth.ethertype == ether_types.ETH_TYPE_IP:
-                ipv4_pkt = pkt.get_protocol(ipv4.ipv4)
-                ip_src = ipv4_pkt.src
-                ip_dst = ipv4_pkt.dst
-                ip_protocol = ipv4_pkt.proto
-                # ICMP
-                if ip_protocol == in_proto.IPPROTO_ICMP:
-                    self.logger.info(
-                        f"[FLOW_ADD] ICMP: Switch={dpid} Proto={ip_protocol} SrcIP={ip_src} DstIP={ip_dst} InPort={in_port}"
-                    )
-                    match = self._create_match(parser, {
-                        'eth_type': ether_types.ETH_TYPE_IP,
-                        'ip_proto': ip_protocol,
-                        'ipv4_src': ip_src,
-                        'ipv4_dst': ip_dst,
-                        'in_port': in_port
-                    })
-                # TCP
-                elif ip_protocol == in_proto.IPPROTO_TCP:
-                    tcp_pkt = pkt.get_protocol(tcp.tcp)
-                    tcp_src_port = tcp_pkt.src_port
-                    tcp_dst_port = tcp_pkt.dst_port
-                    # Handle TCP traffic redirection
-                    if ip_dst == hosts['server_1']['ip'] and dst == hosts['server_1']['mac']:
-                        # Redirect: client -> server_1 -> server_2
-                        match = self._create_match(parser, {
-                            'eth_type': ether_types.ETH_TYPE_IP,
-                            'ip_proto': ip_protocol,
-                            'ipv4_src': ip_src,
-                            'ipv4_dst': ip_dst,
-                            'tcp_src': tcp_src_port,
-                            'tcp_dst': tcp_dst_port
-                        })
-                        self.logger.info(
-                            f"[FLOW_ADD] TCP: Switch={dpid} Proto={ip_protocol} SrcIP={ip_src} DstIP={ip_dst} SrcPort={tcp_src_port} DstPort={tcp_dst_port} (Redirected)"
-                        )
-                        # Modify destination to server_2
-                        ip_dst = hosts['server_2']['ip']
-                        dst = hosts['server_2']['mac']
-                        out_port = self._get_output_port(dpid, dst)
-                        actions = [
-                            parser.OFPActionSetField(eth_dst=dst),
-                            parser.OFPActionSetField(ipv4_dst=ip_dst),
-                            parser.OFPActionOutput(port=out_port)
-                        ]
-                    elif ip_dst == hosts['client']['ip'] and dst == hosts['client']['mac']:
-                        # Rewrite response: server_2 -> client (as if from server_1)
-                        match = self._create_match(parser, {
-                            'eth_type': ether_types.ETH_TYPE_IP,
-                            'ip_proto': ip_protocol,
-                            'ipv4_src': ip_src,
-                            'ipv4_dst': ip_dst,
-                            'tcp_src': tcp_src_port,
-                            'tcp_dst': tcp_dst_port
-                        })
-                        self.logger.info(
-                            f"[FLOW_ADD] TCP: Switch={dpid} Proto={ip_protocol} SrcIP={ip_src} DstIP={ip_dst} SrcPort={tcp_src_port} DstPort={tcp_dst_port} (Rewritten)"
-                        )
-                        # Modify source to server_1
-                        ip_src = hosts['server_1']['ip']
-                        src = hosts['server_1']['mac']
-                        out_port = self._get_output_port(dpid, dst)
-                        actions = [
-                            parser.OFPActionSetField(eth_src=src),
-                            parser.OFPActionSetField(ipv4_src=ip_src),
-                            parser.OFPActionOutput(port=out_port)
-                        ]
-            # invoke add flow method
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow_specific(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow_specific(datapath, 1, match, actions)
-        # check msg data
+        
+        if out_port != ofp.OFPP_FLOOD:
+            flow_match = self._build_match_rule(eth, pkt, in_port, parser, dp, ofp)
+            if flow_match:
+                if msg.buffer_id != ofp.OFP_NO_BUFFER:
+                    self._add_dynamic_flow(dp, 1, flow_match['match'], flow_match['actions'], msg.buffer_id)
+                    self._log_packet_departure(flow_match['final_dst'], flow_match['final_port'])
+                    return
+                else:
+                    self._add_dynamic_flow(dp, 1, flow_match['match'], flow_match['actions'])
+                    actions = flow_match['actions']
+        
         data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+        if msg.buffer_id == ofp.OFP_NO_BUFFER:
             data = msg.data
-        # define output packet
-        out = parser.OFPPacketOut(datapath=datapath,
-                                  buffer_id=msg.buffer_id,
-                                  in_port=in_port,
-                                  actions=actions,
-                                  data=data)
-        # packetOut
-        datapath.send_msg(out)
-        # packetOut logger
-        self.logger.info(
-            f"[PACKET_OUT] DstMAC={dst} OutPort={out_port}"
+        
+        output_packet = parser.OFPPacketOut(
+            datapath=dp,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data
+        )
+        dp.send_msg(output_packet)
+        self._log_packet_departure(dst_mac, out_port)
 
+    def _lookup_port(self, switch_id, mac, ofproto):
+        """Find output port for destination MAC"""
+        if mac in self.forwarding_table[switch_id]:
+            return self.forwarding_table[switch_id][mac]
+        return ofproto.OFPP_FLOOD
+
+    def _build_match_rule(self, eth, pkt, in_port, parser, dp, ofp):
+        """Construct flow match with redirection logic"""
+        result = None
+        
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            self.logger.info(f"Flow Rule: ARP [{eth.src} -> {eth.dst}]")
+            out_port = self._lookup_port(dp.id, eth.dst, ofp)
+            result = {
+                'match': parser.OFPMatch(
+                    eth_type=ether_types.ETH_TYPE_ARP,
+                    in_port=in_port,
+                    eth_dst=eth.dst,
+                    eth_src=eth.src
+                ),
+                'actions': [parser.OFPActionOutput(out_port)],
+                'final_dst': eth.dst,
+                'final_port': out_port
+            }
+        
+        elif eth.ethertype == ether_types.ETH_TYPE_IP:
+            ip_pkt = pkt.get_protocol(ipv4.ipv4)
+            src_ip = ip_pkt.src
+            dst_ip = ip_pkt.dst
+            protocol = ip_pkt.proto
+            
+            if protocol == in_proto.IPPROTO_ICMP:
+                self.logger.info(f"Flow Rule: ICMP [{src_ip} -> {dst_ip}]")
+                out_port = self._lookup_port(dp.id, eth.dst, ofp)
+                result = {
+                    'match': parser.OFPMatch(
+                        eth_type=ether_types.ETH_TYPE_IP,
+                        ip_proto=protocol,
+                        ipv4_src=src_ip,
+                        ipv4_dst=dst_ip,
+                        in_port=in_port
+                    ),
+                    'actions': [parser.OFPActionOutput(out_port)],
+                    'final_dst': eth.dst,
+                    'final_port': out_port
+                }
+            
+            elif protocol == in_proto.IPPROTO_TCP:
+                tcp_pkt = pkt.get_protocol(tcp.tcp)
+                src_port = tcp_pkt.src_port
+                dst_port = tcp_pkt.dst_port
+                
+                redirect_info = self._check_redirection(dst_ip, eth.dst, src_ip, eth.src, dp, ofp)
+                
+                if redirect_info:
+                    self.logger.info(
+                        f"Flow Rule: TCP Redirect [{src_ip}:{src_port} -> {dst_ip}:{dst_port}] "
+                        f"=> {redirect_info['new_ip']}"
+                    )
+                    result = {
+                        'match': parser.OFPMatch(
+                            eth_type=ether_types.ETH_TYPE_IP,
+                            ip_proto=protocol,
+                            ipv4_src=src_ip,
+                            ipv4_dst=dst_ip,
+                            tcp_src=src_port,
+                            tcp_dst=dst_port
+                        ),
+                        'actions': redirect_info['actions'],
+                        'final_dst': redirect_info['new_mac'],
+                        'final_port': redirect_info['port']
+                    }
+                else:
+                    self.logger.info(f"Flow Rule: TCP [{src_ip}:{src_port} -> {dst_ip}:{dst_port}]")
+                    out_port = self._lookup_port(dp.id, eth.dst, ofp)
+                    result = {
+                        'match': parser.OFPMatch(
+                            eth_type=ether_types.ETH_TYPE_IP,
+                            ip_proto=protocol,
+                            ipv4_src=src_ip,
+                            ipv4_dst=dst_ip,
+                            tcp_src=src_port,
+                            tcp_dst=dst_port
+                        ),
+                        'actions': [parser.OFPActionOutput(out_port)],
+                        'final_dst': eth.dst,
+                        'final_port': out_port
+                    }
+        
+        return result
+
+    def _check_redirection(self, dst_ip, dst_mac, src_ip, src_mac, dp, ofp):
+        """Determine if redirection is needed and build redirect actions"""
+        parser = dp.ofproto_parser
+        
+        if dst_ip == self.endpoints['server_primary'].ip and dst_mac == self.endpoints['server_primary'].mac:
+            new_mac = self.endpoints['server_backup'].mac
+            new_ip = self.endpoints['server_backup'].ip
+            port = self._lookup_port(dp.id, new_mac, ofp)
+            
+            return {
+                'new_ip': new_ip,
+                'new_mac': new_mac,
+                'port': port,
+                'actions': [
+                    parser.OFPActionSetField(eth_dst=new_mac),
+                    parser.OFPActionSetField(ipv4_dst=new_ip),
+                    parser.OFPActionOutput(port=port)
+                ]
+            }
+        
+        elif dst_ip == self.endpoints['client'].ip and dst_mac == self.endpoints['client'].mac:
+            new_mac = self.endpoints['server_primary'].mac
+            new_ip = self.endpoints['server_primary'].ip
+            port = self._lookup_port(dp.id, dst_mac, ofp)
+            
+            return {
+                'new_ip': new_ip,
+                'new_mac': new_mac,
+                'port': port,
+                'actions': [
+                    parser.OFPActionSetField(eth_src=new_mac),
+                    parser.OFPActionSetField(ipv4_src=new_ip),
+                    parser.OFPActionOutput(port=port)
+                ]
+            }
+        
+        return None
+
+    def _log_packet_arrival(self, switch_id, src_mac, dst_mac, in_port):
+        """Log incoming packet information"""
+        self.logger.info(
+            f"\n{'='*60}\n"
+            f"Packet In Event\n"
+            f"Switch ID: {switch_id}\n"
+            f"Source: {src_mac} @ Port {in_port}\n"
+            f"Destination: {dst_mac}\n"
+            f"{'='*60}"
+        )
+
+    def _log_packet_departure(self, dst_mac, out_port):
+        """Log outgoing packet information"""
+        self.logger.info(
+            f"\nPacket Out Event\n"
+            f"Target: {dst_mac}\n"
+            f"Output Port: {out_port}\n"
         )
